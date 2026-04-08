@@ -311,359 +311,377 @@ def get_video_duration(path):
         return None
 
 def apply_effects_and_export(input_path, output_path, effects_list, watermark_text,
-                               wm_opacity, wm_font_size, trim_start, trim_end):
+                               wm_opacity, wm_font_size, wm_position, trim_start, trim_end):
     """
-    Core processing pipeline using MoviePy + PIL / numpy.
-    Returns (success: bool, message: str)
+    Timestamp-aware multi-effect pipeline.
+    Every effect carries its own [start, end] window.
+    Multiple effects active at the same timestamp are all applied in order.
     """
     try:
         import numpy as np
-        from moviepy.editor import VideoFileClip, CompositeVideoClip, TextClip, ColorClip
-        from moviepy.video.fx.all import (
-            blackwhite, lum_contrast, colorx, crop, fadein, fadeout,
-            resize, rotate, even_size
-        )
+        from moviepy.editor import VideoFileClip
+        from moviepy.video.fx.all import even_size
 
-        # ── Universal frame sanitiser ─────────────────────────────────────
-        # moviepy fx (blackwhite, colorx, fadein…) can emit float64 frames.
-        # PIL / imageio require uint8. Wrap every fl_image call with this.
+        # ── Helpers ───────────────────────────────────────────────────────
         def u8(frame):
-            """Convert any numeric frame to uint8 [0-255], ensure 3-channel RGB."""
-            arr = np.asarray(frame)
-            if arr.dtype == np.float64 or arr.dtype == np.float32:
-                # float frames from moviepy are in [0, 1] OR [0, 255] — normalise both
-                if arr.max() <= 1.0:
-                    arr = arr * 255.0
-                arr = np.clip(arr, 0, 255)
-            arr = arr.astype(np.uint8)
-            # Drop alpha channel if present
+            """Ensure frame is uint8 RGB (H,W,3)."""
+            arr = np.asarray(frame, dtype=np.float64)
+            if arr.max() <= 1.0 and arr.dtype in (np.float32, np.float64):
+                arr = arr * 255.0
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
             if arr.ndim == 3 and arr.shape[2] == 4:
                 arr = arr[:, :, :3]
             return arr
 
-        def safe(fn):
-            """Wrap an fl_image function so its output is always uint8 RGB."""
-            def wrapped(frame):
-                return u8(fn(u8(frame)))
-            return wrapped
+        def load_font(size):
+            from PIL import ImageFont
+            for path in [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+            ]:
+                try:
+                    return ImageFont.truetype(path, size)
+                except Exception:
+                    pass
+            return ImageFont.load_default()
 
-        # Force the raw clip frames to uint8 immediately after load
+        # ── Single-frame effect dispatch ──────────────────────────────────
+        # Each function takes (frame: uint8 ndarray, t_rel: float) → uint8 ndarray
+        # t_rel = time in seconds relative to the effect's own start
+
+        def fx_black_and_white(frame, t_rel):
+            gray = np.mean(frame, axis=2, keepdims=True).astype(np.uint8)
+            return np.repeat(gray, 3, axis=2)
+
+        def fx_vibrance_boost(frame, t_rel):
+            f = frame.astype(np.float32)
+            mean = f.mean(axis=2, keepdims=True)
+            return np.clip(mean + (f - mean) * 1.6, 0, 255).astype(np.uint8)
+
+        def fx_teal_orange(frame, t_rel):
+            f = frame.astype(np.float32)
+            f[:,:,0] = np.clip(f[:,:,0] * 1.15, 0, 255)
+            f[:,:,2] = np.clip(f[:,:,2] * 0.80, 0, 255)
+            return f.astype(np.uint8)
+
+        def fx_faded_film(frame, t_rel):
+            return np.clip(frame.astype(np.float32) * 0.85 + 30, 0, 255).astype(np.uint8)
+
+        def fx_golden_hour(frame, t_rel):
+            f = frame.astype(np.float32)
+            f[:,:,0] = np.clip(f[:,:,0] * 1.2,  0, 255)
+            f[:,:,1] = np.clip(f[:,:,1] * 1.05, 0, 255)
+            f[:,:,2] = np.clip(f[:,:,2] * 0.75, 0, 255)
+            return f.astype(np.uint8)
+
+        def fx_cool_matte(frame, t_rel):
+            f = frame.astype(np.float32)
+            f[:,:,2] = np.clip(f[:,:,2] * 1.15 + 10, 0, 255)
+            f[:,:,0] = np.clip(f[:,:,0] * 0.88, 0, 255)
+            return np.clip(f * 0.9 + 15, 0, 255).astype(np.uint8)
+
+        def fx_neon_glow(frame, t_rel):
+            from PIL import Image, ImageFilter, ImageChops
+            img = Image.fromarray(frame)
+            glow = img.filter(ImageFilter.GaussianBlur(radius=8))
+            return np.array(ImageChops.add(img, glow, scale=1.5)).astype(np.uint8)
+
+        def fx_duotone(frame, t_rel):
+            gray = np.mean(frame, axis=2, keepdims=True) / 255.0
+            c1 = np.array([255, 60, 110], dtype=np.float32)
+            c2 = np.array([30,  20,  80], dtype=np.float32)
+            return np.clip((1 - gray) * c2 + gray * c1, 0, 255).astype(np.uint8)
+
+        def fx_bokeh(frame, t_rel):
+            from PIL import Image, ImageFilter, ImageDraw
+            img = Image.fromarray(frame)
+            blurred = img.filter(ImageFilter.GaussianBlur(radius=7))
+            mask = Image.new("L", img.size, 0)
+            d = ImageDraw.Draw(mask)
+            cx, cy = img.size[0]//2, img.size[1]//2
+            r = min(cx, cy) // 2
+            d.ellipse([cx-r, cy-r, cx+r, cy+r], fill=255)
+            mask = mask.filter(ImageFilter.GaussianBlur(radius=40))
+            return np.array(Image.composite(img, blurred, mask)).astype(np.uint8)
+
+        def fx_motion_blur(frame, t_rel):
+            from PIL import Image, ImageFilter
+            return np.array(Image.fromarray(frame).filter(ImageFilter.SMOOTH_MORE)).astype(np.uint8)
+
+        def fx_vignette(frame, t_rel):
+            h, w = frame.shape[:2]
+            X, Y = np.meshgrid(np.linspace(-1,1,w), np.linspace(-1,1,h))
+            mask = 1 - np.clip(X**2 + Y**2, 0, 1) ** 0.55
+            return np.clip(frame * mask[:,:,np.newaxis], 0, 255).astype(np.uint8)
+
+        def fx_bloom(frame, t_rel):
+            from PIL import Image, ImageFilter, ImageChops
+            img = Image.fromarray(frame)
+            glow = img.point(lambda p: min(255, p * 1.5)).filter(ImageFilter.GaussianBlur(radius=12))
+            return np.array(ImageChops.screen(img, glow)).astype(np.uint8)
+
+        def fx_light_leak(frame, t_rel):
+            h, w = frame.shape[:2]
+            leak = np.zeros_like(frame, dtype=np.float32)
+            leak[:, :w//3, 0] = 90
+            leak[:, :w//3, 1] = 45
+            return np.clip(frame.astype(np.float32) + leak, 0, 255).astype(np.uint8)
+
+        def fx_lens_flare(frame, t_rel):
+            h, w = frame.shape[:2]
+            f = frame.astype(np.float32)
+            cy = h // 2
+            f[cy-2:cy+2, :, :] += np.array([120, 100, 60], dtype=np.float32) * 0.4
+            return np.clip(f, 0, 255).astype(np.uint8)
+
+        def fx_analog_grain(frame, t_rel):
+            noise = np.random.randint(-18, 18, frame.shape, dtype=np.int16)
+            return np.clip(frame.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
+        def fx_vhs(frame, t_rel):
+            f = frame.copy()
+            f[::2,:,:] = np.clip(f[::2,:,:].astype(np.int16) - 20, 0, 255)
+            r = f[:,:,0].copy()
+            f[:,2:,0] = r[:,:-2]
+            noise = np.random.randint(-8, 8, f.shape, dtype=np.int16)
+            return np.clip(f.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
+        def fx_super8(frame, t_rel):
+            noise = np.random.randint(-25, 25, frame.shape, dtype=np.int16)
+            f = np.clip(frame.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+            h, w = f.shape[:2]
+            X, Y = np.meshgrid(np.linspace(-1,1,w), np.linspace(-1,1,h))
+            vign = 1 - np.clip((X**2 + Y**2) * 1.2, 0, 1)
+            return np.clip(f * vign[:,:,np.newaxis], 0, 255).astype(np.uint8)
+
+        def fx_crt(frame, t_rel):
+            f = frame.copy()
+            f[::3,:,:] = np.clip(f[::3,:,:].astype(np.int16) - 40, 0, 255)
+            return f.astype(np.uint8)
+
+        def fx_lofi(frame, t_rel):
+            return ((frame // 64) * 64).astype(np.uint8)
+
+        def fx_prism(frame, t_rel):
+            r = frame.copy()
+            s = 6
+            r[:, s:,  0] = frame[:, :-s, 0]
+            r[:, :-s, 2] = frame[:, s:,  2]
+            return r.astype(np.uint8)
+
+        def fx_glitch(frame, t_rel):
+            r = frame.copy()
+            fh = frame.shape[0]
+            for _ in range(np.random.randint(3, 9)):
+                y  = np.random.randint(0, max(1, fh - 12))
+                ht = np.random.randint(2, 12)
+                sh = np.random.randint(-25, 25)
+                r[y:y+ht,:,:] = np.roll(r[y:y+ht,:,:], sh, axis=1)
+            return r.astype(np.uint8)
+
+        def fx_fisheye(frame, t_rel):
+            from PIL import Image
+            img = Image.fromarray(frame)
+            w2, h2 = img.size
+            inner = img.resize((int(w2*0.82), int(h2*0.82)), Image.LANCZOS)
+            canvas = Image.new("RGB", (w2, h2), (0,0,0))
+            canvas.paste(inner, ((w2-inner.width)//2, (h2-inner.height)//2))
+            return np.array(canvas).astype(np.uint8)
+
+        def fx_mirror(frame, t_rel):
+            half = frame[:, :frame.shape[1]//2, :]
+            return np.concatenate([half, half[:, ::-1, :]], axis=1).astype(np.uint8)
+
+        def fx_wave(frame, t_rel):
+            h, w = frame.shape[:2]
+            result = np.empty_like(frame)
+            for row in range(h):
+                shift = int(10 * np.sin(2 * np.pi * (row / 30.0 + t_rel * 2)))
+                result[row] = np.roll(frame[row], shift, axis=0)
+            return result.astype(np.uint8)
+
+        def fx_zoom_pulse(frame, t_rel, eff_duration):
+            from PIL import Image
+            # Smooth zoom: 1.0 → 1.15 → 1.0 over the effect window
+            progress = t_rel / max(eff_duration, 0.001)
+            scale = 1.0 + 0.15 * np.sin(np.pi * progress)
+            img = Image.fromarray(frame)
+            w2, h2 = img.size
+            nw, nh = max(w2, int(w2 * scale)), max(h2, int(h2 * scale))
+            resized = img.resize((nw, nh), Image.LANCZOS)
+            ox, oy = (nw - w2) // 2, (nh - h2) // 2
+            return np.array(resized.crop((ox, oy, ox+w2, oy+h2))).astype(np.uint8)
+
+        def fx_whip_pan(frame, t_rel, eff_duration):
+            from PIL import Image, ImageFilter
+            progress = t_rel / max(eff_duration, 0.001)
+            # Blur intensifies toward centre then fades
+            radius = int(30 * np.sin(np.pi * progress))
+            if radius < 1:
+                return frame
+            img = Image.fromarray(frame)
+            # Horizontal motion blur via repeated offset compositing
+            blurred = img.filter(ImageFilter.GaussianBlur(radius=max(1, radius//3)))
+            return np.array(blurred).astype(np.uint8)
+
+        def fx_cross_dissolve(frame, t_rel, eff_duration):
+            # Fade out then back in
+            progress = t_rel / max(eff_duration, 0.001)
+            alpha = 1.0 - 2.0 * abs(progress - 0.5)   # 0→1→0
+            return np.clip(frame.astype(np.float32) * alpha, 0, 255).astype(np.uint8)
+
+        def fx_flash_white(frame, t_rel, eff_duration):
+            progress = t_rel / max(eff_duration, 0.001)
+            intensity = max(0.0, 1.0 - progress * 10)  # instant flash decays quickly
+            return np.clip(frame.astype(np.float32) + intensity * 255, 0, 255).astype(np.uint8)
+
+        def fx_glitch_transition(frame, t_rel, eff_duration):
+            frame = fx_glitch(frame, t_rel)
+            return fx_prism(frame, t_rel)
+
+        def fx_subtitle(frame, t_rel, subtitle_text):
+            from PIL import Image, ImageDraw
+            img = Image.fromarray(frame).convert("RGBA")
+            ov = Image.new("RGBA", img.size, (0,0,0,0))
+            draw = ImageDraw.Draw(ov)
+            font = load_font(36)
+            bbox = draw.textbbox((0,0), subtitle_text, font=font)
+            tw = bbox[2] - bbox[0]
+            x = (img.width - tw) // 2
+            y = img.height - 75
+            draw.text((x+2, y+2), subtitle_text, font=font, fill=(0,0,0,180))
+            draw.text((x,   y),   subtitle_text, font=font, fill=(255,255,255,230))
+            return np.array(Image.alpha_composite(img, ov).convert("RGB")).astype(np.uint8)
+
+        def fx_timestamp(frame, t_rel, clip_t):
+            import datetime
+            ts = str(datetime.timedelta(seconds=int(clip_t))).zfill(8)
+            from PIL import Image, ImageDraw
+            img = Image.fromarray(frame).convert("RGBA")
+            ov  = Image.new("RGBA", img.size, (0,0,0,0))
+            draw = ImageDraw.Draw(ov)
+            font = load_font(28)
+            draw.text((12, 12), ts, font=font, fill=(255,255,255,200))
+            return np.array(Image.alpha_composite(img, ov).convert("RGB")).astype(np.uint8)
+
+        def fx_lower_third(frame, t_rel, subtitle_text):
+            from PIL import Image, ImageDraw
+            img = Image.fromarray(frame).convert("RGBA")
+            ov  = Image.new("RGBA", img.size, (0,0,0,0))
+            draw = ImageDraw.Draw(ov)
+            bar_h = 60
+            draw.rectangle([(0, img.height-bar_h), (img.width, img.height)], fill=(0,0,0,160))
+            font = load_font(32)
+            draw.text((20, img.height - bar_h + 14), subtitle_text, font=font, fill=(255,255,255,240))
+            return np.array(Image.alpha_composite(img, ov).convert("RGB")).astype(np.uint8)
+
+        # ── Effect name → function map ─────────────────────────────────────
+        EFFECT_FN = {
+            "Black & White":         fx_black_and_white,
+            "Vibrance Boost":        fx_vibrance_boost,
+            "Cinematic Teal-Orange": fx_teal_orange,
+            "Faded Film":            fx_faded_film,
+            "Golden Hour":           fx_golden_hour,
+            "Cool Matte":            fx_cool_matte,
+            "Neon Glow":             fx_neon_glow,
+            "Duotone":               fx_duotone,
+            "Lens Blur (Bokeh)":     fx_bokeh,
+            "Motion Blur":           fx_motion_blur,
+            "Glitch":                fx_glitch,
+            "Vignette":              fx_vignette,
+            "Bloom / Halation":      fx_bloom,
+            "Light Leak":            fx_light_leak,
+            "Lens Flare":            fx_lens_flare,
+            "VHS Tape":              fx_vhs,
+            "Super 8mm":             fx_super8,
+            "Analog Grain":          fx_analog_grain,
+            "CRT Screen":            fx_crt,
+            "Lo-Fi Dither":          fx_lofi,
+            "Wave Ripple":           fx_wave,
+            "Mirror / Kaleidoscope": fx_mirror,
+            "Fish Eye":              fx_fisheye,
+            "Prism Shift":           fx_prism,
+        }
+
+        # ── Master per-frame processor ─────────────────────────────────────
+        def process_frame(get_frame, t):
+            # t is the clip-absolute time (seconds from start of trimmed clip)
+            frame = u8(get_frame(t))
+
+            for eff in effects_list:
+                es = eff["start"]
+                ee = eff["end"]
+                if not (es <= t <= ee):
+                    continue                    # ← timestamp gate
+
+                name      = eff["name"]
+                t_rel     = t - es              # time relative to effect start
+                eff_dur   = max(ee - es, 0.001)
+
+                # Effects that need t_rel + duration
+                if name == "Zoom Pulse":
+                    frame = fx_zoom_pulse(frame, t_rel, eff_dur)
+                elif name == "Zoom In/Out Cut":
+                    frame = fx_zoom_pulse(frame, t_rel, eff_dur)
+                elif name == "Whip Pan":
+                    frame = fx_whip_pan(frame, t_rel, eff_dur)
+                elif name == "Cross Dissolve":
+                    frame = fx_cross_dissolve(frame, t_rel, eff_dur)
+                elif name == "Flash White":
+                    frame = fx_flash_white(frame, t_rel, eff_dur)
+                elif name == "Glitch Transition":
+                    frame = fx_glitch_transition(frame, t_rel, eff_dur)
+                elif name == "Wave Ripple":
+                    frame = fx_wave(frame, t_rel)
+                # Text overlays
+                elif name == "Subtitle Burn-in":
+                    frame = fx_subtitle(frame, t_rel, eff.get("subtitle_text", ""))
+                elif name == "Timestamp":
+                    frame = fx_timestamp(frame, t_rel, t)
+                elif name in ("Lower Third", "Sticker Overlay"):
+                    frame = fx_lower_third(frame, t_rel, eff.get("subtitle_text", name))
+                elif name == "Hard Cut":
+                    pass  # no-op
+                elif name in EFFECT_FN:
+                    frame = EFFECT_FN[name](frame, t_rel)
+
+            # ── Watermark (always on, if set) ──────────────────────────────
+            if watermark_text.strip():
+                from PIL import Image, ImageDraw
+                img  = Image.fromarray(frame).convert("RGBA")
+                ov   = Image.new("RGBA", img.size, (0,0,0,0))
+                draw = ImageDraw.Draw(ov)
+                font = load_font(wm_font_size)
+                bbox = draw.textbbox((0,0), watermark_text, font=font)
+                tw   = bbox[2] - bbox[0]
+                th   = bbox[3] - bbox[1]
+                W, H = img.size
+                pad  = 14
+                # Position mapping
+                pos_map = {
+                    "Top Left":      (pad, pad),
+                    "Top Center":    ((W - tw)//2, pad),
+                    "Top Right":     (W - tw - pad, pad),
+                    "Center":        ((W - tw)//2, (H - th)//2),
+                    "Bottom Left":   (pad, H - th - pad),
+                    "Bottom Center": ((W - tw)//2, H - th - pad),
+                    "Bottom Right":  (W - tw - pad, H - th - pad),
+                }
+                x, y = pos_map.get(wm_position, ((W - tw)//2, pad))
+                alpha_val = int(255 * wm_opacity / 100)
+                draw.text((x, y), watermark_text, font=font, fill=(255, 255, 255, alpha_val))
+                frame = np.array(Image.alpha_composite(img, ov).convert("RGB")).astype(np.uint8)
+
+            return frame
+
+        # ── Load clip and wire the master processor ────────────────────────
         clip = VideoFileClip(input_path).subclip(trim_start, trim_end)
-        clip = clip.fl_image(u8)
-        w, h = clip.size
-
-        # ── Apply each effect ─────────────────────────────────────────────
-        for eff in effects_list:
-            name = eff["name"]
-            t_start = eff["start"]
-            t_end   = eff["end"]
-            duration = t_end - t_start
-
-            # Color & Tone
-            if name == "Black & White":
-                clip = blackwhite(clip)
-                clip = clip.fl_image(u8)   # blackwhite returns float
-
-            elif name == "Vibrance Boost":
-                clip = colorx(clip, 1.4)
-                clip = clip.fl_image(u8)   # colorx returns float
-
-            elif name == "Cinematic Teal-Orange":
-                def teal_orange(frame):
-                    img = frame.astype(np.float32)
-                    img[:,:,0] = np.clip(img[:,:,0] * 1.15, 0, 255)
-                    img[:,:,2] = np.clip(img[:,:,2] * 0.85, 0, 255)
-                    return img.astype(np.uint8)
-                clip = clip.fl_image(safe(teal_orange))
-
-            elif name == "Faded Film":
-                def faded(frame):
-                    return np.clip(frame.astype(np.float32) * 0.85 + 30, 0, 255).astype(np.uint8)
-                clip = clip.fl_image(safe(faded))
-
-            elif name == "Golden Hour":
-                def golden(frame):
-                    img = frame.astype(np.float32)
-                    img[:,:,0] = np.clip(img[:,:,0] * 1.2, 0, 255)
-                    img[:,:,1] = np.clip(img[:,:,1] * 1.05, 0, 255)
-                    img[:,:,2] = np.clip(img[:,:,2] * 0.75, 0, 255)
-                    return img.astype(np.uint8)
-                clip = clip.fl_image(safe(golden))
-
-            elif name == "Cool Matte":
-                def cool(frame):
-                    img = frame.astype(np.float32)
-                    img[:,:,2] = np.clip(img[:,:,2] * 1.15 + 10, 0, 255)
-                    img[:,:,0] = np.clip(img[:,:,0] * 0.88, 0, 255)
-                    return np.clip(img * 0.9 + 15, 0, 255).astype(np.uint8)
-                clip = clip.fl_image(safe(cool))
-
-            elif name == "Neon Glow":
-                def neon_glow(frame):
-                    from PIL import Image, ImageFilter, ImageChops
-                    img = Image.fromarray(frame)
-                    glow = img.filter(ImageFilter.GaussianBlur(radius=8))
-                    result = ImageChops.add(img, glow, scale=1.5, offset=0)
-                    return np.array(result).astype(np.uint8)
-                clip = clip.fl_image(safe(neon_glow))
-
-            elif name == "Duotone":
-                def duotone(frame):
-                    gray = np.mean(frame, axis=2, keepdims=True)
-                    color1 = np.array([255, 60, 110], dtype=np.float32)
-                    color2 = np.array([30, 20, 80],  dtype=np.float32)
-                    t = gray / 255.0
-                    result = (1 - t) * color2 + t * color1
-                    return np.clip(result, 0, 255).astype(np.uint8)
-                clip = clip.fl_image(safe(duotone))
-
-            # Blur
-            elif name == "Lens Blur (Bokeh)":
-                def bokeh(frame):
-                    from PIL import Image, ImageFilter, ImageDraw
-                    img = Image.fromarray(frame)
-                    blurred = img.filter(ImageFilter.GaussianBlur(radius=6))
-                    mask = Image.new("L", img.size, 0)
-                    draw = ImageDraw.Draw(mask)
-                    cx, cy = img.size[0]//2, img.size[1]//2
-                    r = min(cx, cy) // 2
-                    draw.ellipse([cx-r, cy-r, cx+r, cy+r], fill=255)
-                    mask = mask.filter(ImageFilter.GaussianBlur(radius=40))
-                    result = Image.composite(img, blurred, mask)
-                    return np.array(result).astype(np.uint8)
-                clip = clip.fl_image(safe(bokeh))
-
-            elif name == "Motion Blur":
-                def motion_blur(frame):
-                    from PIL import Image, ImageFilter
-                    img = Image.fromarray(frame)
-                    return np.array(img.filter(ImageFilter.SMOOTH_MORE)).astype(np.uint8)
-                clip = clip.fl_image(safe(motion_blur))
-
-            elif name == "Vignette":
-                def vignette(frame):
-                    rows, cols = frame.shape[:2]
-                    X, Y = np.meshgrid(np.linspace(-1, 1, cols), np.linspace(-1, 1, rows))
-                    mask = 1 - np.clip(X**2 + Y**2, 0, 1) ** 0.6
-                    return np.clip(frame * mask[:,:,np.newaxis], 0, 255).astype(np.uint8)
-                clip = clip.fl_image(safe(vignette))
-
-            elif name == "Bloom / Halation":
-                def bloom(frame):
-                    from PIL import Image, ImageFilter, ImageChops
-                    img = Image.fromarray(frame)
-                    bright = img.point(lambda p: p * 1.5)
-                    glow = bright.filter(ImageFilter.GaussianBlur(radius=12))
-                    result = ImageChops.screen(img, glow)
-                    return np.array(result).astype(np.uint8)
-                clip = clip.fl_image(safe(bloom))
-
-            elif name == "Light Leak":
-                def light_leak(frame):
-                    h, w = frame.shape[:2]
-                    leak = np.zeros_like(frame, dtype=np.float32)
-                    leak[:, :w//3, 0] = 80
-                    leak[:, :w//3, 1] = 40
-                    result = np.clip(frame.astype(np.float32) + leak, 0, 255)
-                    return result.astype(np.uint8)
-                clip = clip.fl_image(safe(light_leak))
-
-            elif name == "Lens Flare":
-                def lens_flare(frame):
-                    h, w = frame.shape[:2]
-                    result = frame.astype(np.float32).copy()
-                    cy = h // 2
-                    streak = np.zeros((h, w, 3), dtype=np.float32)
-                    streak[cy-2:cy+2, :, :] = [120, 100, 60]
-                    result = np.clip(result + streak * 0.4, 0, 255)
-                    return result.astype(np.uint8)
-                clip = clip.fl_image(safe(lens_flare))
-
-            # Retro
-            elif name == "Analog Grain":
-                def grain(frame):
-                    noise = np.random.randint(-18, 18, frame.shape, dtype=np.int16)
-                    return np.clip(frame.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-                clip = clip.fl_image(safe(grain))
-
-            elif name == "VHS Tape":
-                def vhs(frame):
-                    f = frame.copy()
-                    f[::2, :, :] = np.clip(f[::2, :, :].astype(np.int16) - 20, 0, 255).astype(np.uint8)
-                    r = f[:,:,0].copy()
-                    f[:,2:,0] = r[:,:-2]
-                    noise = np.random.randint(-8, 8, f.shape, dtype=np.int16)
-                    return np.clip(f.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-                clip = clip.fl_image(safe(vhs))
-
-            elif name == "Super 8mm":
-                def super8(frame):
-                    noise = np.random.randint(-25, 25, frame.shape, dtype=np.int16)
-                    f = np.clip(frame.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-                    rows, cols = f.shape[:2]
-                    X, Y = np.meshgrid(np.linspace(-1, 1, cols), np.linspace(-1, 1, rows))
-                    vign = 1 - np.clip((X**2 + Y**2) * 1.2, 0, 1)
-                    return np.clip(f * vign[:,:,np.newaxis], 0, 255).astype(np.uint8)
-                clip = clip.fl_image(safe(super8))
-
-            elif name == "CRT Screen":
-                def crt(frame):
-                    f = frame.copy()
-                    f[::3, :, :] = np.clip(f[::3, :, :].astype(np.int16) - 40, 0, 255).astype(np.uint8)
-                    return f
-                clip = clip.fl_image(safe(crt))
-
-            elif name == "Lo-Fi Dither":
-                def lofi(frame):
-                    reduced = (frame // 64) * 64
-                    return reduced.astype(np.uint8)
-                clip = clip.fl_image(safe(lofi))
-
-            # Distortion
-            elif name == "Prism Shift":
-                def prism(frame):
-                    result = frame.copy().astype(np.uint8)
-                    shift = 5
-                    result[:, shift:, 0] = frame[:, :-shift, 0]
-                    result[:, :-shift, 2] = frame[:, shift:, 2]
-                    return result
-                clip = clip.fl_image(safe(prism))
-
-            elif name == "Glitch":
-                def glitch(frame):
-                    result = frame.copy()
-                    num_glitch = np.random.randint(3, 8)
-                    fh = frame.shape[0]
-                    for _ in range(num_glitch):
-                        y = np.random.randint(0, max(1, fh - 10))
-                        ht = np.random.randint(2, 10)
-                        shift = np.random.randint(-20, 20)
-                        result[y:y+ht, :, :] = np.roll(result[y:y+ht, :, :], shift, axis=1)
-                    return result.astype(np.uint8)
-                clip = clip.fl_image(safe(glitch))
-
-            elif name == "Fish Eye":
-                def fisheye(frame):
-                    from PIL import Image
-                    img = Image.fromarray(frame)
-                    w2, h2 = img.size
-                    # Simple barrel distortion via resize trick
-                    inner = img.resize((int(w2*0.85), int(h2*0.85)), Image.LANCZOS)
-                    canvas = Image.new("RGB", (w2, h2), (0,0,0))
-                    ox = (w2 - inner.width) // 2
-                    oy = (h2 - inner.height) // 2
-                    canvas.paste(inner, (ox, oy))
-                    return np.array(canvas).astype(np.uint8)
-                clip = clip.fl_image(safe(fisheye))
-
-            elif name == "Mirror / Kaleidoscope":
-                def mirror(frame):
-                    half = frame[:, :frame.shape[1]//2, :]
-                    return np.concatenate([half, half[:, ::-1, :]], axis=1).astype(np.uint8)
-                clip = clip.fl_image(safe(mirror))
-
-            elif name == "Wave Ripple":
-                def wave(frame):
-                    from PIL import Image
-                    img = Image.fromarray(frame)
-                    w2, h2 = img.size
-                    result = np.array(img).copy()
-                    for row in range(h2):
-                        shift = int(8 * np.sin(2 * np.pi * row / 30))
-                        result[row] = np.roll(frame[row], shift, axis=0)
-                    return result.astype(np.uint8)
-                clip = clip.fl_image(safe(wave))
-
-            # Transitions
-            elif name == "Cross Dissolve":
-                clip = fadein(clip, duration=min(0.5, duration / 2))
-                clip = fadeout(clip, duration=min(0.5, duration / 2))
-                clip = clip.fl_image(u8)
-
-            elif name == "Flash White":
-                def flash(get_frame, t):
-                    frame = u8(get_frame(t))
-                    if t < 0.1:
-                        alpha = 1 - t / 0.1
-                        frame = np.clip(frame.astype(np.float32) + alpha * 255, 0, 255).astype(np.uint8)
-                    return frame
-                clip = clip.fl(flash)
-
-            elif name == "Zoom In/Out Cut":
-                def zoom_pulse(get_frame, t):
-                    frame = u8(get_frame(t))
-                    scale = 1.0 + 0.05 * np.sin(2 * np.pi * t / max(duration, 0.1))
-                    from PIL import Image
-                    img = Image.fromarray(frame)
-                    w2, h2 = img.size
-                    nw, nh = int(w2 * scale), int(h2 * scale)
-                    resized = img.resize((nw, nh), Image.LANCZOS)
-                    ox, oy = (nw - w2) // 2, (nh - h2) // 2
-                    cropped = resized.crop((ox, oy, ox + w2, oy + h2))
-                    return np.array(cropped).astype(np.uint8)
-                clip = clip.fl(zoom_pulse)
-
-            # Subtitle burn-in
-            elif name == "Subtitle Burn-in":
-                subtitle_text = eff.get("subtitle_text", "Sample subtitle")
-                sub_op = wm_opacity / 100.0
-                def sub_frame(frame):
-                    from PIL import Image, ImageDraw, ImageFont
-                    frame = u8(frame)
-                    img = Image.fromarray(frame).convert("RGBA")
-                    overlay = Image.new("RGBA", img.size, (0,0,0,0))
-                    draw = ImageDraw.Draw(overlay)
-                    try:
-                        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
-                    except Exception:
-                        font = ImageFont.load_default()
-                    bbox = draw.textbbox((0,0), subtitle_text, font=font)
-                    tw = bbox[2] - bbox[0]
-                    x = (img.width - tw) // 2
-                    y = img.height - 70
-                    # Shadow
-                    draw.text((x+2, y+2), subtitle_text, font=font, fill=(0,0,0,180))
-                    draw.text((x, y), subtitle_text, font=font, fill=(255,255,255,230))
-                    combined = Image.alpha_composite(img, overlay).convert("RGB")
-                    return np.array(combined).astype(np.uint8)
-                clip = clip.fl_image(safe(sub_frame))
-
-        # ── Watermark ─────────────────────────────────────────────────────────
-        if watermark_text.strip():
-            wm = watermark_text
-            op = wm_opacity / 100.0
-            fs = wm_font_size
-            def wm_frame(frame):
-                from PIL import Image, ImageDraw, ImageFont
-                frame = u8(frame)
-                img = Image.fromarray(frame).convert("RGBA")
-                overlay = Image.new("RGBA", img.size, (0,0,0,0))
-                draw = ImageDraw.Draw(overlay)
-                font = None
-                for font_path in [
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-                    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
-                ]:
-                    try:
-                        font = ImageFont.truetype(font_path, fs)
-                        break
-                    except Exception:
-                        continue
-                if font is None:
-                    font = ImageFont.load_default()
-                bbox = draw.textbbox((0,0), wm, font=font)
-                tw = bbox[2] - bbox[0]
-                x = (img.width - tw) // 2
-                y = int(img.height * 0.03)
-                draw.text((x, y), wm, font=font, fill=(255, 255, 255, int(255 * op)))
-                combined = Image.alpha_composite(img, overlay).convert("RGB")
-                return np.array(combined).astype(np.uint8)
-            clip = clip.fl_image(safe(wm_frame))
-
-        # ── Final uint8 pass + export ─────────────────────────────────────
-        clip = clip.fl_image(u8)   # belt-and-braces: ensure uint8 going into encoder
+        clip = clip.fl(process_frame, apply_to=["mask", "video"])
         clip = even_size(clip)
+
+        # ── Export ────────────────────────────────────────────────────────
         clip.write_videofile(
             output_path,
             codec="libx264",
@@ -676,6 +694,7 @@ def apply_effects_and_export(input_path, output_path, effects_list, watermark_te
         )
         clip.close()
         return True, "Export successful"
+
     except Exception as e:
         import traceback
         return False, f"{e}\n\n{traceback.format_exc()}"
@@ -816,21 +835,47 @@ st.markdown('</div>', unsafe_allow_html=True)
 # ── Watermark ─────────────────────────────────────────────────────────────────
 st.markdown('<div class="card"><div class="card-title">🔏 Watermark</div>', unsafe_allow_html=True)
 
-wm_col1, wm_col2, wm_col3 = st.columns([3, 1.5, 1.5])
-with wm_col1:
+wm_row1c1, wm_row1c2 = st.columns([3, 1])
+with wm_row1c1:
     watermark_text = st.text_input("Watermark text", placeholder="@yourhandle  or  YourBrand™", key="wm_text", label_visibility="collapsed")
-with wm_col2:
-    wm_opacity = st.slider("Opacity", 5, 50, 20, 1, key="wm_op", format="%d%%")
-with wm_col3:
+with wm_row1c2:
+    wm_position = st.selectbox(
+        "Position",
+        ["Top Left", "Top Center", "Top Right", "Center", "Bottom Left", "Bottom Center", "Bottom Right"],
+        index=1, key="wm_pos",
+    )
+
+wm_row2c1, wm_row2c2 = st.columns(2)
+with wm_row2c1:
+    wm_opacity = st.slider("Opacity", 5, 60, 20, 1, key="wm_op", format="%d%%")
+with wm_row2c2:
     wm_font_size = st.slider("Font size", 16, 72, 32, 2, key="wm_fs", format="%dpx")
 
-# Live preview strip
+# Live preview — 9-zone grid
 if watermark_text.strip():
+    POS_CSS = {
+        "Top Left":      "top:8px;left:10px;transform:none",
+        "Top Center":    "top:8px;left:50%;transform:translateX(-50%)",
+        "Top Right":     "top:8px;right:10px;transform:none",
+        "Center":        "top:50%;left:50%;transform:translate(-50%,-50%)",
+        "Bottom Left":   "bottom:8px;left:10px;transform:none",
+        "Bottom Center": "bottom:8px;left:50%;transform:translateX(-50%)",
+        "Bottom Right":  "bottom:8px;right:10px;transform:none",
+    }
+    css_pos = POS_CSS.get(wm_position, "top:8px;left:50%;transform:translateX(-50%)")
+    scaled_fs = int(wm_font_size * 0.55)
     st.markdown(f"""
-<div class="wm-preview">
-  <span class="wm-text" style="opacity:{wm_opacity/100}; font-size:{wm_font_size}px">{watermark_text}</span>
+<div style="position:relative;background:#1c1c27;border:1px solid #2a2a3d;border-radius:12px;
+            height:90px;overflow:hidden;margin-top:0.5rem;">
+  <span style="position:absolute;{css_pos};opacity:{wm_opacity/100};
+               font-size:{scaled_fs}px;color:white;white-space:nowrap;
+               font-family:'Syne',sans-serif;letter-spacing:2px;">
+    {watermark_text}
+  </span>
 </div>
-<p style="font-size:0.78rem;color:#6e6a8a;margin-top:0.4rem;">↑ Preview: watermark appears at top-center, transparent over your video</p>
+<p style="font-size:0.78rem;color:#6e6a8a;margin-top:0.4rem;">
+  ↑ Preview · Position: <b style="color:#f0eeff">{wm_position}</b> · Opacity: <b style="color:#f0eeff">{wm_opacity}%</b>
+</p>
 """, unsafe_allow_html=True)
 
 st.markdown('</div>', unsafe_allow_html=True)
@@ -876,6 +921,7 @@ if export_ready:
                 watermark_text=watermark_text,
                 wm_opacity=wm_opacity,
                 wm_font_size=wm_font_size,
+                wm_position=wm_position,
                 trim_start=trim_start,
                 trim_end=trim_end,
             )
